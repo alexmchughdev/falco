@@ -23,6 +23,10 @@ limitations under the License.
 #include <cerrno>
 #include <cstdio>
 #include "compat.h"
+#else
+#include <windows.h>
+#include <process.h>
+#include <cstdio>
 #endif
 
 #include "actions.h"
@@ -69,19 +73,48 @@ falco::app::run_result falco::app::actions::pidfile(const falco::app::state& sta
 
 	::close(fd);
 #else
-	int64_t self_pid = getpid();
-
-	std::ofstream stream;
-	stream.open(state.options.pidfilename);
-
-	if(!stream.good()) {
-		falco_logger::log(
-		        falco_logger::level::ERR,
-		        "Could not write pid to pidfile " + state.options.pidfilename + ". Exiting.\n");
+	// FILE_FLAG_OPEN_REPARSE_POINT is the Windows analog of O_NOFOLLOW: it
+	// opens the reparse point itself rather than its target. We then refuse
+	// to write if the handle refers to a reparse point, blocking the same
+	// symlink/junction TOCTOU attack as the POSIX path above.
+	HANDLE h = CreateFileA(state.options.pidfilename.c_str(),
+	                       GENERIC_WRITE,
+	                       FILE_SHARE_READ,
+	                       nullptr,
+	                       CREATE_ALWAYS,
+	                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+	                       nullptr);
+	if(h == INVALID_HANDLE_VALUE) {
+		falco_logger::log(falco_logger::level::ERR,
+		                  "Could not write pid to pidfile " + state.options.pidfilename +
+		                          " (error: " + std::to_string(GetLastError()) +
+		                          "). Exiting.\n");
 		exit(-1);
 	}
-	stream << self_pid;
-	stream.close();
+
+	BY_HANDLE_FILE_INFORMATION info{};
+	if(!GetFileInformationByHandle(h, &info) ||
+	   (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		CloseHandle(h);
+		falco_logger::log(falco_logger::level::ERR,
+		                  "Refusing to write pidfile " + state.options.pidfilename +
+		                          ": path is a reparse point. Exiting.\n");
+		exit(-1);
+	}
+
+	char buf[32];
+	int len = std::snprintf(buf, sizeof(buf), "%lld\n", (long long)_getpid());
+	DWORD written = 0;
+	if(len < 0 || !WriteFile(h, buf, (DWORD)len, &written, nullptr) ||
+	   written != (DWORD)len) {
+		CloseHandle(h);
+		falco_logger::log(falco_logger::level::ERR,
+		                  "Could not write pid to pidfile " + state.options.pidfilename +
+		                          " (error: " + std::to_string(GetLastError()) +
+		                          "). Exiting.\n");
+		exit(-1);
+	}
+	CloseHandle(h);
 #endif
 
 	return run_result::ok();
